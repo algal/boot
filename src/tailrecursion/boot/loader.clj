@@ -8,15 +8,21 @@
 
 (ns tailrecursion.boot.loader
   (:require
+   [classlojure.core         :as cl]
    [clojure.java.io          :as io]
    [clojure.string           :as string]
    [clojure.pprint           :as pprint]
    [cemerick.pomegranate     :as pom]
    [clojure.stacktrace       :as trace]
    [tailrecursion.boot.strap :as strap])
+  (:import
+   [java.net URLClassLoader URL]
+   java.lang.management.ManagementFactory)
   (:gen-class))
 
 (def min-core-version "2.0.0")
+
+(def dfl-repos #{"http://clojars.org/repo/" "http://repo1.maven.org/maven2/"})
 
 (defmacro guard [expr & [default]]
   `(try ~expr (catch Throwable _# ~default)))
@@ -49,6 +55,25 @@
   (let [[_ & kvs] (guard (read-string (slurp (io/resource "project.clj"))))]
     (->> kvs (partition 2) (map (partial apply vector)) (into {}))))
 
+(def ^:private core-dep (atom nil))
+(def ^:private cl2      (atom false))
+
+(defn get-classloader
+  "Returns classloader with only boot-classloader.jar in its class path. This
+  classloader is used to segregate the pomegranate dependencies to keep them
+  from interfering with project dependencies."
+  []
+  (when (compare-and-set! cl2 false true)
+    (let [tmp (doto (io/file ".boot") .mkdirs)
+          in  (io/resource "boot-classloader.jar")
+          out (io/file tmp "boot-classloader.jar")]
+      (with-open [in  (io/input-stream in)
+                  out (io/output-stream out)]
+        (io/copy in out))
+      (reset! cl2 (cl/classlojure (str "file:" (.getPath out))))))
+  (cl/eval-in @cl2 '(require 'tailrecursion.boot-classloader))
+  @cl2)
+
 (defn index-of [v val]
   (ffirst (filter (comp #{val} second) (map vector (range) v))))
 
@@ -60,53 +85,25 @@
 
 (def exclude-clj (partial exclude ['org.clojure/clojure]))
 
-(defn transfer-listener
-  [{type :type meth :method {name :name repo :repository} :resource err :error}]
-  (when (.endsWith name ".jar")
-    (case type
-      :started              (warn "Retrieving %s from %s\n" name repo)
-      (:corrupted :failed)  (when err (warn "Error: %s\n" (.getMessage err)))
-      nil)))
+(defn add-urls!
+  "Add URLs (directories or JAR files) to the classpath."
+  [urls]
+  (when (seq urls)
+    (let [meth  (doto (.getDeclaredMethod URLClassLoader "addURL" (into-array Class [URL]))
+                  (.setAccessible true))
+          cldr  (ClassLoader/getSystemClassLoader)
+          urls  (->> urls (map io/file) (filter #(.exists %)) (map #(.. % toURI toURL)))]
+      (doseq [url urls] (.invoke meth cldr (object-array [url]))))))
 
-(defn ^:from-leiningen build-url
-  "Creates java.net.URL from string"
-  [url]
-  (try (java.net.URL. url)
-       (catch java.net.MalformedURLException _
-         (java.net.URL. (str "http://" url)))))
+(defn resolve-dependencies! [deps repos]
+  (read-string
+    (cl/eval-in (get-classloader)
+      `(do (require 'tailrecursion.boot-classloader)
+           (tailrecursion.boot-classloader/resolve-dependencies! ~deps ~repos)))))
 
-(defn ^:from-leiningen get-non-proxy-hosts []
-  (let [system-no-proxy (System/getenv "no_proxy")]
-    (if (not-empty system-no-proxy)
-      (->> (string/split system-no-proxy #",")
-           (map #(str "*" %))
-           (string/join "|")))))
-
-(defn ^:from-leiningen get-proxy-settings
-  "Returns a map of the JVM proxy settings"
-  ([] (get-proxy-settings "http_proxy"))
-  ([key]
-     (if-let [proxy (System/getenv key)]
-       (let [url (build-url proxy)
-             user-info (.getUserInfo url)
-             [username password] (and user-info (.split user-info ":"))]
-         {:host            (.getHost url)
-          :port            (.getPort url)
-          :username        username
-          :password        password
-          :non-proxy-hosts (get-non-proxy-hosts)}))))
-
-(def core-dep    (atom nil))
-(def dfl-repos   #{"http://clojars.org/repo/" "http://repo1.maven.org/maven2/"})
-
-(defn add-dependencies!
-  ([deps] (add-dependencies! deps dfl-repos))
-  ([deps repos]
-     (let [deps (mapv exclude-clj deps)]
-       (pom/add-dependencies :coordinates        deps
-         :repositories       (zipmap repos repos)
-         :transfer-listener  transfer-listener
-         :proxy              (get-proxy-settings)))))
+(defn add-dependencies! [deps & [repos]]
+  (add-urls! (->> (resolve-dependencies! deps (or repos dfl-repos))
+               (map #(str "file:" (:jar %))))))
 
 (defrecord CoreVersion [depspec])
 
