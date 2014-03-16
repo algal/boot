@@ -12,7 +12,6 @@
    [clojure.java.io          :as io]
    [clojure.string           :as string]
    [clojure.pprint           :as pprint]
-   [cemerick.pomegranate     :as pom]
    [clojure.stacktrace       :as trace]
    [tailrecursion.boot.strap :as strap])
   (:import
@@ -71,7 +70,6 @@
                   out (io/output-stream out)]
         (io/copy in out))
       (reset! cl2 (cl/classlojure (str "file:" (.getPath out))))))
-  (cl/eval-in @cl2 '(require 'tailrecursion.boot-classloader))
   @cl2)
 
 (defn index-of [v val]
@@ -96,14 +94,13 @@
       (doseq [url urls] (.invoke meth cldr (object-array [url]))))))
 
 (defn resolve-dependencies! [deps repos]
-  (read-string
-    (cl/eval-in (get-classloader)
-      `(do (require 'tailrecursion.boot-classloader)
-           (tailrecursion.boot-classloader/resolve-dependencies! ~deps ~repos)))))
+  (cl/eval-in (get-classloader)
+    `(do (require 'tailrecursion.boot-classloader)
+         (tailrecursion.boot-classloader/resolve-dependencies! '~deps '~repos))))
 
 (defn add-dependencies! [deps & [repos]]
   (add-urls! (->> (resolve-dependencies! deps (or repos dfl-repos))
-               (map #(str "file:" (:jar %))))))
+               (map #(URL. (str "file://" (:jar %)))))))
 
 (defrecord CoreVersion [depspec])
 
